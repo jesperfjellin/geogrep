@@ -1,6 +1,6 @@
 # geogrep
 
-Developer notes for building and running the project locally.
+Fuzzy grep for geospatial data.
 
 ## Requirements
 
