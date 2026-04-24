@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -20,14 +21,6 @@ struct Cli {
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
 
-    /// Minimum match score to include, from 0 to 100.
-    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = parse_threshold)]
-    threshold: u8,
-
-    /// Maximum number of ranked file/layer summaries to print.
-    #[arg(long, value_parser = parse_limit)]
-    limit: Option<usize>,
-
     /// Search layer names.
     #[arg(long)]
     layers: bool,
@@ -39,6 +32,18 @@ struct Cli {
     /// Search feature attribute values.
     #[arg(long)]
     values: bool,
+
+    /// Minimum match score to include, from 0 to 100.
+    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = parse_threshold)]
+    threshold: u8,
+
+    /// Maximum number of ranked file/layer summaries to print.
+    #[arg(long, value_parser = parse_limit)]
+    limit: Option<usize>,
+
+    /// Skip files larger than this many MB.
+    #[arg(long = "sizelimit", value_name = "MB", value_parser = parse_sizelimit)]
+    sizelimit_mb: Option<u64>,
 
     /// Print diagnostics for skipped files during directory searches.
     #[arg(long)]
@@ -69,10 +74,15 @@ fn run() -> Result<bool> {
     let options = search::SearchOptions {
         threshold: cli.threshold,
         scopes: search::SearchScopes::from_flags(cli.layers, cli.columns, cli.values),
+        size_limit_bytes: cli.sizelimit_mb.map(mb_to_bytes),
         verbose: cli.verbose,
+        progress: std::io::stderr().is_terminal(),
     };
-    let mut summaries = search::search_paths(&paths, &cli.query, options)?;
+    let search_result = search::search_paths(&paths, &cli.query, options)?;
+    let mut summaries = search_result.summaries;
     output::rank_summaries(&mut summaries);
+
+    output::emit_scan_summary(&search_result.stats);
 
     let limit = cli.limit.unwrap_or(summaries.len()).min(summaries.len());
     for summary in &summaries[..limit] {
@@ -102,4 +112,19 @@ fn parse_limit(raw: &str) -> std::result::Result<usize, String> {
     } else {
         Err("limit must be a positive integer".to_owned())
     }
+}
+
+fn parse_sizelimit(raw: &str) -> std::result::Result<u64, String> {
+    let limit = raw
+        .parse::<u64>()
+        .map_err(|_| "sizelimit must be a positive integer number of MB".to_owned())?;
+    if limit > 0 {
+        Ok(limit)
+    } else {
+        Err("sizelimit must be a positive integer number of MB".to_owned())
+    }
+}
+
+fn mb_to_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1024).saturating_mul(1024)
 }

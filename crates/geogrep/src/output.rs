@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
+use crate::search::SearchStats;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerSummary {
     pub score: u8,
@@ -9,6 +11,14 @@ pub struct LayerSummary {
     pub best: String,
     pub matched_features: usize,
     pub exact_values: usize,
+}
+
+pub fn emit_scan_summary(stats: &SearchStats) {
+    println!(
+        "Datasets found: {}. Total files checked: {}",
+        stats.datasets_found, stats.files_checked
+    );
+    println!();
 }
 
 pub fn rank_summaries(summaries: &mut [LayerSummary]) {
