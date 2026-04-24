@@ -6,9 +6,7 @@
 
 # Large local GIS fixtures. Keep small committed fixtures, but do not commit
 # bulky real-world datasets directly to git.
-/tests/data/innsjo.fgb
-/tests/data/local/
-
+/tests/data/*.*
 # Logs, coverage, and profiler output
 *.log
 *.profraw
@@ -33,3 +31,6 @@ Thumbs.db
 
 # Rustfmt backup files
 **/*.rs.bk
+
+# Internal docs
+SPEC.md
