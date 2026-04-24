@@ -1,15 +1,115 @@
 use crate::matcher::{Query, score};
 use crate::output;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use gdal::Dataset;
 use gdal::vector::{FieldValue, LayerAccess};
+use ignore::WalkBuilder;
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn search_file(path: &Path, raw_query: &str, threshold: u8) -> Result<()> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchOptions {
+    pub threshold: u8,
+    pub scopes: SearchScopes,
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchScopes {
+    pub layers: bool,
+    pub columns: bool,
+    pub values: bool,
+}
+
+impl SearchScopes {
+    pub fn from_flags(layers: bool, columns: bool, values: bool) -> Self {
+        if layers || columns || values {
+            Self {
+                layers,
+                columns,
+                values,
+            }
+        } else {
+            Self::all()
+        }
+    }
+
+    fn all() -> Self {
+        Self {
+            layers: true,
+            columns: true,
+            values: true,
+        }
+    }
+}
+
+pub fn search_paths(
+    paths: &[PathBuf],
+    raw_query: &str,
+    options: SearchOptions,
+) -> Result<Vec<output::LayerSummary>> {
     let query = Query::new(raw_query);
+    let mut results = Vec::new();
+
+    for path in paths {
+        if path.is_dir() {
+            results.extend(search_directory(path, &query, options));
+        } else if path.is_file() {
+            results.extend(search_file_with_query(path, &query, options)?);
+        } else {
+            bail!(
+                "path does not exist or is not searchable: {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(results)
+}
+
+fn search_directory(
+    path: &Path,
+    query: &Query,
+    options: SearchOptions,
+) -> Vec<output::LayerSummary> {
+    let mut results = Vec::new();
+    let mut walker = WalkBuilder::new(path);
+    walker.standard_filters(false);
+
+    for entry in walker.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                if options.verbose {
+                    eprintln!("skipping walk entry: {err}");
+                }
+                continue;
+            }
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        match search_file_with_query(entry.path(), query, options) {
+            Ok(matches) => results.extend(matches),
+            Err(err) if options.verbose => {
+                eprintln!("skipping {}: {err:#}", entry.path().display());
+            }
+            Err(_) => {}
+        }
+    }
+
+    results
+}
+
+fn search_file_with_query(
+    path: &Path,
+    query: &Query,
+    options: SearchOptions,
+) -> Result<Vec<output::LayerSummary>> {
     let dataset = Dataset::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut results = Vec::new();
 
     for idx in 0..dataset.layer_count() {
         let mut layer = dataset
@@ -18,46 +118,51 @@ pub fn search_file(path: &Path, raw_query: &str, threshold: u8) -> Result<()> {
         let layer_name = layer.name();
         let mut summary = LayerSummary::new(path, &layer_name);
 
-        let s = score(&query, &layer_name);
-        if s >= threshold {
-            summary.record_structural_hit(Hit::layer(s, &layer_name));
-        }
-
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-
-        for name in &field_names {
-            let s = score(&query, name);
-            if s >= threshold {
-                summary.record_structural_hit(Hit::field(s, name));
+        if options.scopes.layers {
+            let s = score(&query, &layer_name);
+            if s >= options.threshold {
+                summary.record_structural_hit(Hit::layer(s, &layer_name));
             }
         }
 
-        for feature in layer.features() {
-            let fid = feature.fid();
-            let mut feature_matched = false;
-            for (name, value) in feature.fields() {
-                let Some(fv) = value else { continue };
-                let text = match field_value_to_text(&fv) {
-                    Some(t) if !t.is_empty() => t,
-                    _ => continue,
-                };
-                let s = score(&query, &text);
-                if s >= threshold {
-                    feature_matched = true;
-                    let is_exact = query.is_exact_match(&text);
-                    summary.record_value_hit(Hit::value(s, &name, &text, is_exact), is_exact);
+        if options.scopes.columns {
+            for field in layer.defn().fields() {
+                let name = field.name();
+                let s = score(&query, &name);
+                if s >= options.threshold {
+                    summary.record_structural_hit(Hit::field(s, &name));
                 }
             }
-            if feature_matched {
-                summary.record_feature_match(fid);
+        }
+
+        if options.scopes.values {
+            for feature in layer.features() {
+                let fid = feature.fid();
+                let mut feature_matched = false;
+                for (name, value) in feature.fields() {
+                    let Some(fv) = value else { continue };
+                    let text = match field_value_to_text(&fv) {
+                        Some(t) if !t.is_empty() => t,
+                        _ => continue,
+                    };
+                    let s = score(&query, &text);
+                    if s >= options.threshold {
+                        feature_matched = true;
+                        let is_exact = query.is_exact_match(&text);
+                        summary.record_value_hit(Hit::value(s, &name, &text, is_exact), is_exact);
+                    }
+                }
+                if feature_matched {
+                    summary.record_feature_match(fid);
+                }
             }
         }
 
         if let Some(result) = summary.into_result() {
-            output::emit_layer_summary(&result);
+            results.push(result);
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 fn field_value_to_text(fv: &FieldValue) -> Option<String> {
@@ -73,8 +178,37 @@ fn field_value_to_text(fv: &FieldValue) -> Option<String> {
     }
 }
 
-struct LayerSummary<'a> {
-    path: &'a Path,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_scope_searches_all_surfaces() {
+        assert_eq!(
+            SearchScopes::from_flags(false, false, false),
+            SearchScopes {
+                layers: true,
+                columns: true,
+                values: true
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_scope_flags_restrict_search_surfaces() {
+        assert_eq!(
+            SearchScopes::from_flags(false, true, false),
+            SearchScopes {
+                layers: false,
+                columns: true,
+                values: false
+            }
+        );
+    }
+}
+
+struct LayerSummary {
+    path: PathBuf,
     layer: String,
     best: Option<Hit>,
     matched_fids: HashSet<u64>,
@@ -82,10 +216,10 @@ struct LayerSummary<'a> {
     exact_values: usize,
 }
 
-impl<'a> LayerSummary<'a> {
-    fn new(path: &'a Path, layer: &str) -> Self {
+impl LayerSummary {
+    fn new(path: &Path, layer: &str) -> Self {
         Self {
-            path,
+            path: path.to_path_buf(),
             layer: layer.to_owned(),
             best: None,
             matched_fids: HashSet::new(),
@@ -123,7 +257,7 @@ impl<'a> LayerSummary<'a> {
         }
     }
 
-    fn into_result(self) -> Option<output::LayerSummary<'a>> {
+    fn into_result(self) -> Option<output::LayerSummary> {
         let best = self.best?;
         Some(output::LayerSummary {
             score: best.score,
