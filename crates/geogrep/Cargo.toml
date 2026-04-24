@@ -16,3 +16,4 @@ clap = { version = "4", features = ["derive"] }
 fuzzy-matcher = "0.3"
 deunicode = "1.6"
 ignore = "0.4"
+rayon = "1"

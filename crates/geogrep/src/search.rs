@@ -4,14 +4,17 @@ use anyhow::{Context, Result, bail};
 use gdal::Dataset;
 use gdal::vector::{FieldValue, LayerAccess};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PROGRESS_DRAW_INTERVAL: Duration = Duration::from_millis(250);
 const LARGE_DATASET_NOTICE_BYTES: u64 = 1024 * 1024 * 1024;
+type SharedProgress = Arc<Mutex<Progress>>;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SearchOptions {
@@ -70,19 +73,26 @@ pub fn search_paths(
 ) -> Result<SearchResult> {
     let query = Query::new(raw_query);
     let mut results = Vec::new();
-    let mut progress = Progress::new(options.progress);
+    let progress = Arc::new(Mutex::new(Progress::new(options.progress)));
 
     for path in paths {
         if path.is_dir() {
-            results.extend(search_directory(path, &query, options, &mut progress));
-        } else if path.is_file() {
-            results.extend(search_file_with_query(
+            results.extend(search_directory(
                 path,
                 &query,
                 options,
-                &mut progress,
-            )?);
+                Arc::clone(&progress),
+            ));
+        } else if path.is_file() {
+            match search_file_with_query(path, &query, options, &progress) {
+                Ok(matches) => results.extend(matches),
+                Err(err) => {
+                    finish_progress(&progress);
+                    return Err(err);
+                }
+            }
         } else {
+            finish_progress(&progress);
             bail!(
                 "path does not exist or is not searchable: {}",
                 path.display()
@@ -90,10 +100,10 @@ pub fn search_paths(
         }
     }
 
-    progress.finish();
+    let stats = finish_progress(&progress);
     Ok(SearchResult {
         summaries: results,
-        stats: progress.stats(),
+        stats,
     })
 }
 
@@ -101,72 +111,92 @@ fn search_directory(
     path: &Path,
     query: &Query,
     options: SearchOptions,
-    progress: &mut Progress,
+    progress: SharedProgress,
 ) -> Vec<output::LayerSummary> {
-    let mut results = Vec::new();
     let mut walker = WalkBuilder::new(path);
     walker.standard_filters(false);
     walker.filter_entry(|entry| !is_hidden_dir(entry));
 
-    for entry in walker.build() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                if options.verbose {
-                    progress.clear_line();
-                    eprintln!("skipping walk entry: {err}");
+    walker
+        .build()
+        .par_bridge()
+        .filter_map(|entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if options.verbose {
+                        with_progress(&progress, |progress| progress.clear_line());
+                        eprintln!("skipping walk entry: {err}");
+                    }
+                    return None;
                 }
-                continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return None;
             }
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
 
-        match search_file_with_query(entry.path(), query, options, progress) {
-            Ok(matches) => results.extend(matches),
-            Err(err) if options.verbose => {
-                progress.clear_line();
-                eprintln!("skipping {}: {err:#}", entry.path().display());
+            match search_file_with_query(entry.path(), query, options, &progress) {
+                Ok(matches) => Some(matches),
+                Err(err) if options.verbose => {
+                    with_progress(&progress, |progress| progress.clear_line());
+                    eprintln!("skipping {}: {err:#}", entry.path().display());
+                    None
+                }
+                Err(_) => None,
             }
-            Err(_) => {}
-        }
-    }
-
-    results
+        })
+        .flatten()
+        .collect()
 }
 
 fn search_file_with_query(
     path: &Path,
     query: &Query,
     options: SearchOptions,
-    progress: &mut Progress,
+    progress: &SharedProgress,
 ) -> Result<Vec<output::LayerSummary>> {
-    progress.record_file(path);
+    with_progress(progress, |progress| progress.record_file(path));
+    if should_skip_vector_probe(path) {
+        if options.verbose {
+            with_progress(progress, |progress| progress.clear_line());
+            eprintln!(
+                "skipping {}: scientific/raster container extension",
+                path.display()
+            );
+        }
+        return Ok(Vec::new());
+    }
+
     let file_size = file_size_bytes(path)?;
     if file_exceeds_size_limit(file_size, options.size_limit_bytes) {
         if options.verbose {
-            progress.clear_line();
+            with_progress(progress, |progress| progress.clear_line());
             eprintln!("skipping {}: file exceeds --sizelimit", path.display());
         }
         return Ok(Vec::new());
     }
 
     if file_size >= LARGE_DATASET_NOTICE_BYTES {
-        progress.record_large_dataset_open(file_size, path);
+        with_progress(progress, |progress| {
+            progress.record_large_dataset_open(file_size, path)
+        });
     }
     let dataset = Dataset::open(path).with_context(|| format!("opening {}", path.display()))?;
     if file_size >= LARGE_DATASET_NOTICE_BYTES {
-        progress.record_large_dataset_scan(file_size, path);
+        with_progress(progress, |progress| {
+            progress.record_large_dataset_scan(file_size, path)
+        });
     }
     let mut results = Vec::new();
     let layer_count = dataset.layer_count();
     if layer_count == 0 {
-        progress.clear_large_dataset_status(path);
+        with_progress(progress, |progress| {
+            progress.clear_large_dataset_status(path)
+        });
         return Ok(results);
     }
 
-    progress.record_dataset(path);
+    with_progress(progress, |progress| progress.record_dataset(path));
 
     for idx in 0..layer_count {
         let mut layer = dataset
@@ -197,7 +227,9 @@ fn search_file_with_query(
             for feature in layer.features() {
                 feature_progress += 1;
                 if feature_progress >= 1000 {
-                    progress.record_features(feature_progress, path);
+                    with_progress(progress, |progress| {
+                        progress.record_features(feature_progress, path)
+                    });
                     feature_progress = 0;
                 }
 
@@ -221,7 +253,9 @@ fn search_file_with_query(
                 }
             }
             if feature_progress > 0 {
-                progress.record_features(feature_progress, path);
+                with_progress(progress, |progress| {
+                    progress.record_features(feature_progress, path)
+                });
             }
         }
 
@@ -229,8 +263,10 @@ fn search_file_with_query(
             results.push(result);
         }
     }
-    progress.record_matching_layers(results.len(), path);
-    progress.clear_large_dataset_status(path);
+    with_progress(progress, |progress| {
+        progress.record_matching_layers(results.len(), path);
+        progress.clear_large_dataset_status(path);
+    });
     Ok(results)
 }
 
@@ -246,6 +282,17 @@ fn file_exceeds_size_limit(file_size_bytes: u64, size_limit_bytes: Option<u64>) 
         return false;
     };
     file_size_bytes > limit
+}
+
+fn should_skip_vector_probe(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "h5" | "hdf" | "hdf5" | "he5" | "nc" | "nc4"
+    )
 }
 
 fn field_value_to_text(fv: &FieldValue) -> Option<String> {
@@ -273,7 +320,7 @@ fn is_hidden_dir(entry: &ignore::DirEntry) -> bool {
 struct Progress {
     enabled: bool,
     stats: SearchStats,
-    large_dataset_status: Option<String>,
+    large_dataset_status: Option<(PathBuf, String)>,
     last_draw: Instant,
     line_len: usize,
     finished: bool,
@@ -304,17 +351,28 @@ impl Progress {
     }
 
     fn record_large_dataset_open(&mut self, file_size: u64, path: &Path) {
-        self.large_dataset_status = Some(format_large_dataset_status("Opening", file_size));
+        self.large_dataset_status = Some((
+            path.to_path_buf(),
+            format_large_dataset_status("Opening", file_size),
+        ));
         self.draw(path);
     }
 
     fn record_large_dataset_scan(&mut self, file_size: u64, path: &Path) {
-        self.large_dataset_status = Some(format_large_dataset_status("Scanning", file_size));
+        self.large_dataset_status = Some((
+            path.to_path_buf(),
+            format_large_dataset_status("Scanning", file_size),
+        ));
         self.draw(path);
     }
 
     fn clear_large_dataset_status(&mut self, path: &Path) {
-        if self.large_dataset_status.take().is_some() {
+        let should_clear = self
+            .large_dataset_status
+            .as_ref()
+            .is_some_and(|(status_path, _)| status_path == path);
+        if should_clear {
+            self.large_dataset_status = None;
             self.draw(path);
         }
     }
@@ -365,7 +423,7 @@ impl Progress {
             self.stats.datasets_found, self.stats.files_checked
         );
         let line = match &self.large_dataset_status {
-            Some(status) => format!("{line}. {status}"),
+            Some((_, status)) => format!("{line}. {status}"),
             None => line,
         };
         let line_len = line.chars().count();
@@ -373,6 +431,18 @@ impl Progress {
         let _ = io::stderr().flush();
         self.line_len = line_len;
     }
+}
+
+fn with_progress<R>(progress: &SharedProgress, f: impl FnOnce(&mut Progress) -> R) -> R {
+    let mut progress = progress.lock().unwrap_or_else(|err| err.into_inner());
+    f(&mut progress)
+}
+
+fn finish_progress(progress: &SharedProgress) -> SearchStats {
+    with_progress(progress, |progress| {
+        progress.finish();
+        progress.stats()
+    })
 }
 
 fn format_large_dataset_status(action: &str, file_size: u64) -> String {
@@ -424,6 +494,15 @@ mod tests {
     #[test]
     fn missing_size_limit_does_not_skip_files() {
         assert!(!file_exceeds_size_limit(2, None));
+    }
+
+    #[test]
+    fn skips_hdf5_and_netcdf_containers_before_gdal_probe() {
+        assert!(should_skip_vector_probe(Path::new("data/foo.h5")));
+        assert!(should_skip_vector_probe(Path::new("data/foo.HDF5")));
+        assert!(should_skip_vector_probe(Path::new("data/foo.nc")));
+        assert!(!should_skip_vector_probe(Path::new("data/foo.gpkg")));
+        assert!(!should_skip_vector_probe(Path::new("data/foo.fgb")));
     }
 
     #[test]
