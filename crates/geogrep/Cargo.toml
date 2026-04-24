@@ -1,0 +1,12 @@
+[package]
+name = "geogrep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gdal.workspace = true
+ggio = { path = "../ggio" }
+fuzzy-matcher = "0.3"
+deunicode = "1.6"

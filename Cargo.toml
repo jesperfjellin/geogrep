@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/ggio", "crates/geogrep"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+gdal = "0.19"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

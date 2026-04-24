@@ -1,0 +1,15 @@
+# Portable PKG_CONFIG_PATH for the `gdal` crate's build.
+#
+# Scoped to cargo invocations in this repo only — does not touch the user's
+# global shell env. pkg-config silently skips directories that do not exist,
+# so listing paths for platforms you are not on costs nothing.
+#
+# Covered: Debian/Ubuntu multi-arch, Fedora/RHEL, Arch/generic, macOS
+# Homebrew (ARM + Intel), and Linuxbrew. This makes `cargo build` work
+# out of the box on any Unix-like system with libgdal-dev installed via
+# the platform's standard package manager, regardless of which pkg-config
+# happens to be first on PATH.
+#
+# Windows (vcpkg) has a different discovery path; documented separately.
+[env]
+PKG_CONFIG_PATH = { value = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/home/linuxbrew/.linuxbrew/lib/pkgconfig:/home/linuxbrew/.linuxbrew/share/pkgconfig", force = true }
