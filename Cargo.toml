@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ggio", "crates/geogrep"]
+members = ["crates/geogrep"]
 
 [workspace.package]
 version = "0.1.0"

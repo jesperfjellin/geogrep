@@ -249,17 +249,8 @@ dependencies = [
  "deunicode",
  "fuzzy-matcher",
  "gdal",
- "ggio",
  "ignore",
  "rayon",
-]
-
-[[package]]
-name = "ggio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gdal",
 ]
 
 [[package]]
