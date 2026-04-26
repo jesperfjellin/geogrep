@@ -1,6 +1,6 @@
 # geogrep
 
-Fuzzy grep for geospatial vector data.
+Fuzzy grep for geospatial vector data and their attributes
 
 ## Install
 
