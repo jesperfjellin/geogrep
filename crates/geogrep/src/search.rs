@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 const PROGRESS_DRAW_INTERVAL: Duration = Duration::from_millis(250);
 const LARGE_DATASET_NOTICE_BYTES: u64 = 1024 * 1024 * 1024;
 type SharedProgress = Arc<Mutex<Progress>>;
+type SharedTimings = Arc<Mutex<Vec<FileTiming>>>;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SearchOptions {
@@ -24,6 +25,7 @@ pub struct SearchOptions {
     pub size_limit_bytes: Option<u64>,
     pub verbose: bool,
     pub progress: bool,
+    pub collect_timings: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -37,6 +39,14 @@ pub struct SearchScopes {
 pub struct SearchResult {
     pub summaries: Vec<output::LayerSummary>,
     pub stats: SearchStats,
+    pub timings: Vec<FileTiming>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FileTiming {
+    pub path: PathBuf,
+    pub open_duration: Duration,
+    pub scan_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -80,6 +90,9 @@ pub fn search_paths(
     let query = Query::new(raw_query);
     let mut results = Vec::new();
     let progress = Arc::new(Mutex::new(Progress::new(options.progress)));
+    let timings: Option<SharedTimings> = options
+        .collect_timings
+        .then(|| Arc::new(Mutex::new(Vec::new())));
 
     for path in paths {
         if path.is_dir() {
@@ -88,9 +101,10 @@ pub fn search_paths(
                 &query,
                 options,
                 Arc::clone(&progress),
+                timings.as_ref().map(Arc::clone),
             ));
         } else if path.is_file() {
-            match search_file_with_query(path, &query, options, &progress) {
+            match search_file_with_query(path, &query, options, &progress, timings.as_ref()) {
                 Ok(matches) => results.extend(matches),
                 Err(err) => {
                     finish_progress(&progress);
@@ -107,9 +121,16 @@ pub fn search_paths(
     }
 
     let stats = finish_progress(&progress);
+    let timings = timings
+        .map(|t| {
+            let mut guard = t.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        })
+        .unwrap_or_default();
     Ok(SearchResult {
         summaries: results,
         stats,
+        timings,
     })
 }
 
@@ -118,6 +139,7 @@ fn search_directory(
     query: &Query,
     options: SearchOptions,
     progress: SharedProgress,
+    timings: Option<SharedTimings>,
 ) -> Vec<output::LayerSummary> {
     let extracts_dir_canon = extract::extracts_directory().and_then(|p| p.canonicalize().ok());
     let mut walker = WalkBuilder::new(path);
@@ -144,7 +166,8 @@ fn search_directory(
                 return None;
             }
 
-            match search_file_with_query(entry.path(), query, options, &progress) {
+            match search_file_with_query(entry.path(), query, options, &progress, timings.as_ref())
+            {
                 Ok(matches) => Some(matches),
                 Err(err) if options.verbose => {
                     with_progress(&progress, |progress| progress.clear_line());
@@ -163,6 +186,7 @@ fn search_file_with_query(
     query: &Query,
     options: SearchOptions,
     progress: &SharedProgress,
+    timings: Option<&SharedTimings>,
 ) -> Result<Vec<output::LayerSummary>> {
     with_progress(progress, |progress| progress.record_file(path));
     if should_skip_vector_probe(path) {
@@ -201,7 +225,9 @@ fn search_file_with_query(
             progress.record_large_dataset_open(file_size, path)
         });
     }
+    let open_start = timings.map(|_| Instant::now());
     let dataset = Dataset::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let open_duration = open_start.map(|s| s.elapsed());
     if file_size >= LARGE_DATASET_NOTICE_BYTES {
         with_progress(progress, |progress| {
             progress.record_large_dataset_scan(file_size, path)
@@ -213,11 +239,13 @@ fn search_file_with_query(
         with_progress(progress, |progress| {
             progress.clear_large_dataset_status(path)
         });
+        record_timing(timings, path, open_duration, Some(Duration::ZERO));
         return Ok(results);
     }
 
     with_progress(progress, |progress| progress.record_dataset(path, file_size));
 
+    let scan_start = timings.map(|_| Instant::now());
     for idx in 0..layer_count {
         let mut layer = dataset
             .layer(idx)
@@ -284,11 +312,33 @@ fn search_file_with_query(
             results.push(result);
         }
     }
+    let scan_duration = scan_start.map(|s| s.elapsed());
+    record_timing(timings, path, open_duration, scan_duration);
+
     with_progress(progress, |progress| {
         progress.record_matching_layers(results.len(), path);
         progress.clear_large_dataset_status(path);
     });
     Ok(results)
+}
+
+fn record_timing(
+    timings: Option<&SharedTimings>,
+    path: &Path,
+    open_duration: Option<Duration>,
+    scan_duration: Option<Duration>,
+) {
+    let (Some(t), Some(open_duration), Some(scan_duration)) =
+        (timings, open_duration, scan_duration)
+    else {
+        return;
+    };
+    let mut guard = t.lock().unwrap_or_else(|e| e.into_inner());
+    guard.push(FileTiming {
+        path: path.to_path_buf(),
+        open_duration,
+        scan_duration,
+    });
 }
 
 fn file_size_bytes(path: &Path) -> Result<u64> {
