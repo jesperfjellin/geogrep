@@ -55,6 +55,11 @@ struct Cli {
     /// output exceeds 100 MB.
     #[arg(long)]
     extract: bool,
+
+    /// Print per-dataset open and scan durations after results, sorted by
+    /// total time. Useful for spotting which file is taking the longest.
+    #[arg(long)]
+    timings: bool,
 }
 
 fn main() -> ExitCode {
@@ -84,6 +89,7 @@ fn run() -> Result<bool> {
         size_limit_bytes: cli.sizelimit_mb.map(mb_to_bytes),
         verbose: cli.verbose,
         progress: std::io::stderr().is_terminal(),
+        collect_timings: cli.timings,
     };
     let search_result = search::search_paths(&paths, &cli.query, options)?;
     let mut summaries = search_result.summaries;
@@ -94,6 +100,10 @@ fn run() -> Result<bool> {
     let limit = cli.limit.unwrap_or(summaries.len()).min(summaries.len());
     for summary in &summaries[..limit] {
         output::emit_layer_summary(summary);
+    }
+
+    if cli.timings {
+        output::emit_timings(&search_result.timings);
     }
 
     if cli.extract {

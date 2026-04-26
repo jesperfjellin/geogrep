@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use crate::search::SearchStats;
+use crate::search::{FileTiming, SearchStats};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerSummary {
@@ -74,6 +75,58 @@ pub fn emit_layer_summary(summary: &LayerSummary) {
     println!();
 }
 
+const TIMINGS_TOP_N: usize = 20;
+
+pub fn emit_timings(timings: &[FileTiming]) {
+    if timings.is_empty() {
+        println!("Timings: no datasets opened.");
+        return;
+    }
+
+    let mut sorted: Vec<&FileTiming> = timings.iter().collect();
+    sorted.sort_by(|a, b| {
+        let total_a = a.open_duration + a.scan_duration;
+        let total_b = b.open_duration + b.scan_duration;
+        total_b.cmp(&total_a)
+    });
+
+    let n = sorted.len().min(TIMINGS_TOP_N);
+    println!("Timings (top {n} of {} datasets opened):", timings.len());
+    for t in &sorted[..n] {
+        let total = t.open_duration + t.scan_duration;
+        println!(
+            "  {:>8}  scan={:>8}  open={:>8}  {}",
+            format_duration(total),
+            format_duration(t.scan_duration),
+            format_duration(t.open_duration),
+            t.path.display(),
+        );
+    }
+    println!();
+
+    let total_open: Duration = timings.iter().map(|t| t.open_duration).sum();
+    let total_scan: Duration = timings.iter().map(|t| t.scan_duration).sum();
+    println!(
+        "Totals: open {}, scan {}, sum {}",
+        format_duration(total_open),
+        format_duration(total_scan),
+        format_duration(total_open + total_scan),
+    );
+}
+
+pub fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs >= 1.0 {
+        format!("{secs:.1}s")
+    } else if secs >= 0.001 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if d.is_zero() {
+        "0ms".to_owned()
+    } else {
+        "<1ms".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +177,16 @@ mod tests {
         assert_eq!(format_byte_size(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(format_byte_size(1024_u64.pow(4)), "1.0 TB");
         assert_eq!(format_byte_size(45_u64 * 1024_u64.pow(3) + 1024_u64.pow(3) / 3), "45.3 GB");
+    }
+
+    #[test]
+    fn format_duration_scales_units() {
+        assert_eq!(format_duration(Duration::ZERO), "0ms");
+        assert_eq!(format_duration(Duration::from_micros(100)), "<1ms");
+        assert_eq!(format_duration(Duration::from_millis(50)), "50ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1.0s");
+        assert_eq!(format_duration(Duration::from_secs_f64(1.5)), "1.5s");
+        assert_eq!(format_duration(Duration::from_secs(120)), "120.0s");
     }
 }
