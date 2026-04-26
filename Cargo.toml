@@ -3,9 +3,13 @@ resolver = "2"
 members = ["crates/geogrep"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
+license = "MIT"
+description = "Fuzzy grep for geospatial vector data"
+repository = "https://github.com/jesperfjellin/geogrep"
+homepage = "https://github.com/jesperfjellin/geogrep"
 
 [workspace.dependencies]
 anyhow = "1"
