@@ -9,6 +9,8 @@ pub struct Query {
     trailing_boundary: bool,
     normalized_self_score: i64,
     compact_self_score: i64,
+    /// Built from `compact` (alnum subset of `normalized`) so it remains correctness-preserving for both forms.
+    ascii_bits: u64,
 }
 
 impl Query {
@@ -19,12 +21,14 @@ impl Query {
         let matcher = SkimMatcherV2::default();
         let normalized_self_score = self_score(&matcher, &normalized);
         let compact_self_score = self_score(&matcher, &compact);
+        let ascii_bits = ascii_alnum_bitmap(compact.as_bytes());
         Self {
             normalized,
             compact,
             trailing_boundary,
             normalized_self_score,
             compact_self_score,
+            ascii_bits,
         }
     }
 
@@ -38,6 +42,9 @@ impl Query {
 /// Exact normalized/compact equality scores 100. Everything else is delegated to
 /// Skim's mature fuzzy matcher and normalized to fit the CLI score scale.
 pub fn score(query: &Query, candidate: &str) -> u8 {
+    if !candidate_may_match(query.ascii_bits, candidate) {
+        return 0;
+    }
     let cand_norm = normalize(candidate);
     if cand_norm.is_empty() {
         return 0;
@@ -116,6 +123,50 @@ fn fuzzy_score(
         .unwrap_or(0)
 }
 
+/// Cheap necessary-condition check before the full normalize + fuzzy pipeline.
+/// Skim is subsequence-style, so a candidate missing any byte the compact
+/// query needs scores 0 on either form.
+fn candidate_may_match(query_bits: u64, candidate: &str) -> bool {
+    if query_bits == 0 {
+        return true;
+    }
+    let mut bits: u64 = 0;
+    for &b in candidate.as_bytes() {
+        // Non-ASCII bytes can fold to alnum after deunicode (e.g. å → a); pass through.
+        if b >= 0x80 {
+            return true;
+        }
+        if let Some(bit) = ascii_alnum_bit(b) {
+            bits |= 1u64 << bit;
+            if bits & query_bits == query_bits {
+                return true;
+            }
+        }
+    }
+    bits & query_bits == query_bits
+}
+
+fn ascii_alnum_bit(b: u8) -> Option<u32> {
+    let lower = b.to_ascii_lowercase();
+    if lower.is_ascii_lowercase() {
+        Some((lower - b'a') as u32)
+    } else if lower.is_ascii_digit() {
+        Some(26 + (lower - b'0') as u32)
+    } else {
+        None
+    }
+}
+
+fn ascii_alnum_bitmap(bytes: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    for &b in bytes {
+        if let Some(bit) = ascii_alnum_bit(b) {
+            bits |= 1u64 << bit;
+        }
+    }
+    bits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +241,29 @@ mod tests {
         let q = Query::new("Rambergveien 41");
         let s = score(&q, "Completely different string");
         assert!(s < 50, "expected <50, got {s}");
+    }
+
+    #[test]
+    fn ascii_alnum_bit_encodes_letters_and_digits() {
+        assert_eq!(ascii_alnum_bit(b'a'), Some(0));
+        assert_eq!(ascii_alnum_bit(b'A'), Some(0));
+        assert_eq!(ascii_alnum_bit(b'z'), Some(25));
+        assert_eq!(ascii_alnum_bit(b'0'), Some(26));
+        assert_eq!(ascii_alnum_bit(b'9'), Some(35));
+        assert_eq!(ascii_alnum_bit(b' '), None);
+        assert_eq!(ascii_alnum_bit(b'!'), None);
+    }
+
+    #[test]
+    fn candidate_may_match_handles_ascii_and_unicode() {
+        let bits = ascii_alnum_bitmap(b"abc1");
+        assert!(candidate_may_match(bits, "ABC1xyz"));
+        assert!(!candidate_may_match(bits, "abc"));
+        assert!(!candidate_may_match(bits, "completely unrelated"));
+        // Non-ASCII bypass keeps deunicode-folded matches alive.
+        assert!(candidate_may_match(bits, "Snåsa abc1"));
+        assert!(candidate_may_match(bits, "Snåsa"));
+        // Empty bitmap (no alnum query) accepts everything.
+        assert!(candidate_may_match(0, ""));
     }
 }
