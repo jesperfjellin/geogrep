@@ -53,4 +53,19 @@ gg --limit 10 --sizelimit 200 "Berlin"
 gg --layers "cities" ~/data
 ```
 
+## Flags
 
+Scope (combine freely; default searches all three):
+
+- `--layers` — layer names
+- `--columns` — field names
+- `--values` — feature attribute values
+
+Other:
+
+- `--threshold <0-100>` — minimum fuzzy score (default 80)
+- `--limit <n>` — cap on printed summaries
+- `--sizelimit <MB>` — skip files larger than this
+- `--verbose` — print diagnostics for skipped or unreadable files
+- `--extract` — write matched features to `~/geogrep/extracts/` (prompts on first use and for outputs over 100 MB)
+- `--timings` — per-dataset open/scan time breakdown, sorted by total time
