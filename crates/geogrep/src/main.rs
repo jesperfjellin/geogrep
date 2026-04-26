@@ -4,6 +4,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod extract;
 mod matcher;
 mod normalize;
 mod output;
@@ -48,6 +49,12 @@ struct Cli {
     /// Print diagnostics for skipped files during directory searches.
     #[arg(long)]
     verbose: bool,
+
+    /// Extract value-matched features from the dominant dataset/layer into a
+    /// new file beside the input. Prompts for confirmation if the estimated
+    /// output exceeds 100 MB.
+    #[arg(long)]
+    extract: bool,
 }
 
 fn main() -> ExitCode {
@@ -87,6 +94,16 @@ fn run() -> Result<bool> {
     let limit = cli.limit.unwrap_or(summaries.len()).min(summaries.len());
     for summary in &summaries[..limit] {
         output::emit_layer_summary(summary);
+    }
+
+    if cli.extract {
+        if let Some(extraction) = extract::extract_dominant(&summaries, &cli.query)? {
+            eprintln!(
+                "--extract: wrote {} features to {}",
+                extraction.features_written,
+                extraction.output_path.display(),
+            );
+        }
     }
 
     Ok(!summaries.is_empty())
